@@ -496,6 +496,11 @@ fn convert_result(res: crate::rusto_ocr::DetectTextResult) -> DetectTextResult {
     }
 }
 
+/// Copy foreign bytes into an owned UniFFI buffer.
+///
+/// # Safety
+/// `bytes` must point to readable memory for its declared length throughout the
+/// call. `out_status` must be a valid, exclusively borrowed status object.
 #[no_mangle]
 pub unsafe extern "C" fn ffi_uniffi_rusto_rustbuffer_from_bytes(
     bytes: uniffi::ForeignBytes,
@@ -504,6 +509,11 @@ pub unsafe extern "C" fn ffi_uniffi_rusto_rustbuffer_from_bytes(
     uniffi::uniffi_rustbuffer_from_bytes(bytes, out_status)
 }
 
+/// Release a buffer previously allocated by this UniFFI runtime.
+///
+/// # Safety
+/// `buf` must be a live allocation from this runtime and must not have been freed
+/// or be used again after this call. `out_status` must be valid and exclusive.
 #[no_mangle]
 pub unsafe extern "C" fn ffi_uniffi_rusto_rustbuffer_free(
     buf: uniffi::RustBuffer,

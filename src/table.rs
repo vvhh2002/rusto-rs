@@ -1,7 +1,12 @@
 use crate::engine::{EngineError, EngineSession, InferenceSession};
 use crate::types::EngineConfig;
 use ndarray::{Array3, ArrayD};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+pub mod recovery;
+mod slanet;
+pub use slanet::TablePrediction;
 
 #[cfg(feature = "use-opencv")]
 use opencv::prelude::*;
@@ -10,7 +15,7 @@ use opencv::prelude::*;
 use crate::image_impl::Mat;
 
 /// Bounding box for table cells
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BBox {
     pub x_min: i32,
     pub y_min: i32,
@@ -19,7 +24,7 @@ pub struct BBox {
 }
 
 /// Table cell information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableCell {
     pub bbox: BBox,
     pub row: usize,
@@ -30,13 +35,13 @@ pub struct TableCell {
 }
 
 /// Table row
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableRow {
     pub cells: Vec<TableCell>,
 }
 
 /// Complete table structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStructure {
     pub rows: Vec<TableRow>,
     pub num_rows: usize,
@@ -47,7 +52,7 @@ impl TableStructure {
     /// Generate HTML table from structure
     pub fn to_html(&self) -> String {
         let mut html = String::from("<table>\n");
-        
+
         for row in &self.rows {
             html.push_str("  <tr>\n");
             for cell in &row.cells {
@@ -61,19 +66,20 @@ impl TableStructure {
                 } else {
                     String::new()
                 };
-                
+
                 // Escape HTML special characters
-                let text = cell.text
+                let text = cell
+                    .text
                     .replace('&', "&amp;")
                     .replace('<', "&lt;")
                     .replace('>', "&gt;")
                     .replace('"', "&quot;");
-                
+
                 html.push_str(&format!("    <td{}{}>{}</td>\n", colspan, rowspan, text));
             }
             html.push_str("  </tr>\n");
         }
-        
+
         html.push_str("</table>");
         html
     }
@@ -116,7 +122,7 @@ impl TableStructure {
 }
 
 /// Configuration for table detection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDetectorConfig {
     pub model_path: std::path::PathBuf,
     pub conf_threshold: f32,
@@ -124,7 +130,7 @@ pub struct TableDetectorConfig {
     pub model_type: TableModelType,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum TableModelType {
     Wireless, // Borderless tables
     Wired,    // Bordered tables
@@ -151,11 +157,17 @@ impl TableDetector {
     pub fn new(config: TableDetectorConfig) -> Result<Self, EngineError> {
         let engine_config = EngineConfig::default();
         let session = EngineSession::from_path(&config.model_path, &engine_config)?;
-        
-        Ok(Self { _session: session, _config: config })
+
+        Ok(Self {
+            _session: session,
+            _config: config,
+        })
     }
 
-    pub fn with_custom_session(config: TableDetectorConfig, session: impl InferenceSession + 'static) -> Self {
+    pub fn with_custom_session(
+        config: TableDetectorConfig,
+        session: impl InferenceSession + 'static,
+    ) -> Self {
         Self {
             _session: EngineSession::from_custom(session),
             _config: config,
@@ -166,13 +178,13 @@ impl TableDetector {
     pub fn detect(&mut self, img: &Mat) -> Result<Vec<BBox>, EngineError> {
         // Preprocess image for RT-DETR (640x640)
         let (input_tensor, scale_x, scale_y, orig_w, orig_h) = self.preprocess(img)?;
-        
+
         // Run inference
         let mut inputs = HashMap::new();
         inputs.insert("image".to_string(), input_tensor);
-        
+
         let outputs = self._session.run_with_inputs(inputs)?;
-        
+
         // Postprocess: decode bounding boxes
         self.postprocess(outputs, scale_x, scale_y, orig_w, orig_h)
     }
@@ -180,32 +192,32 @@ impl TableDetector {
     fn preprocess(&self, image: &Mat) -> Result<(ArrayD<f32>, f32, f32, i32, i32), EngineError> {
         #[cfg(feature = "use-opencv")]
         let (orig_h, orig_w) = (image.rows(), image.cols());
-        
+
         #[cfg(not(feature = "use-opencv"))]
         let size = image.size()?;
         #[cfg(not(feature = "use-opencv"))]
         let (orig_h, orig_w) = (size.height, size.width);
-        
+
         // RT-DETR expects 640x640 input
         let target_size = 640;
         let scale = (target_size as f32) / (orig_h.max(orig_w) as f32);
         let new_h = (orig_h as f32 * scale) as i32;
         let new_w = (orig_w as f32 * scale) as i32;
-        
+
         #[cfg(not(feature = "use-opencv"))]
         {
             use crate::image_impl::{resize, Size, INTER_LINEAR};
-            
+
             let mut resized = Mat::default();
             resize(image, &mut resized, Size::new(new_w, new_h), INTER_LINEAR)?;
-            
+
             // ImageNet normalization
             let mean = [0.485f32, 0.456, 0.406];
             let std = [0.229f32, 0.224, 0.225];
-            
+
             // Pad to 640x640
             let mut data = vec![0.0f32; 3 * target_size * target_size];
-            
+
             for y in 0..new_h as usize {
                 for x in 0..new_w as usize {
                     let pixel = resized.get_pixel(x as u32, y as u32);
@@ -216,17 +228,23 @@ impl TableDetector {
                     }
                 }
             }
-            
+
             let arr = Array3::from_shape_vec((3, target_size, target_size), data)
                 .map_err(|e| EngineError::Preprocess(e.to_string()))?;
-            
-            Ok((arr.insert_axis(ndarray::Axis(0)).into_dyn(), scale, scale, orig_w, orig_h))
+
+            Ok((
+                arr.insert_axis(ndarray::Axis(0)).into_dyn(),
+                scale,
+                scale,
+                orig_w,
+                orig_h,
+            ))
         }
-        
+
         #[cfg(feature = "use-opencv")]
         {
             use opencv::{core, imgproc};
-            
+
             let mut resized = Mat::default();
             imgproc::resize(
                 image,
@@ -236,14 +254,14 @@ impl TableDetector {
                 0.0,
                 imgproc::INTER_LINEAR,
             )?;
-            
+
             // ImageNet normalization
             let mean = [0.485f32, 0.456, 0.406];
             let std = [0.229f32, 0.224, 0.225];
-            
+
             let hw = target_size * target_size;
             let mut data = vec![0.0f32; 3 * hw];
-            
+
             for y in 0..new_h as usize {
                 for x in 0..new_w as usize {
                     let pix = resized.at_2d::<core::Vec3b>(y as i32, x as i32)?;
@@ -255,30 +273,47 @@ impl TableDetector {
                     }
                 }
             }
-            
+
             let arr = Array3::from_shape_vec((3, target_size, target_size), data)
                 .map_err(|e| EngineError::Preprocess(e.to_string()))?;
-            
-            Ok((arr.insert_axis(ndarray::Axis(0)).into_dyn(), scale, scale, orig_w, orig_h))
+
+            Ok((
+                arr.insert_axis(ndarray::Axis(0)).into_dyn(),
+                scale,
+                scale,
+                orig_w,
+                orig_h,
+            ))
         }
     }
 
-    fn postprocess(&self, outputs: HashMap<String, ArrayD<f32>>, scale_x: f32, scale_y: f32, orig_w: i32, orig_h: i32) -> Result<Vec<BBox>, EngineError> {
+    fn postprocess(
+        &self,
+        outputs: HashMap<String, ArrayD<f32>>,
+        scale_x: f32,
+        scale_y: f32,
+        orig_w: i32,
+        orig_h: i32,
+    ) -> Result<Vec<BBox>, EngineError> {
         // RT-DETR typically outputs: boxes [N, 4] and scores [N, num_classes]
         // Find the output tensors
-        let boxes = outputs.values().next()
+        let boxes = outputs
+            .values()
+            .next()
             .ok_or_else(|| EngineError::OutputError("No output tensor found".to_string()))?;
-        
-        // For now, return empty as actual RT-DETR output parsing requires
-        // understanding the specific model output format
-        // This is a placeholder that can be extended when testing with actual model
+
+        // A cell detector without a verified output contract must not masquerade
+        // as a successful empty detection. SLANet Plus does not need this model.
         let _ = (scale_x, scale_y, orig_w, orig_h, boxes);
-        Ok(Vec::new())
+        Err(EngineError::OutputError(
+            "RT-DETR cell decoding is not implemented; use SLANet Plus joint structure and boxes"
+                .into(),
+        ))
     }
 }
 
 /// Configuration for table structure recognition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStructureConfig {
     pub model_path: std::path::PathBuf,
     pub model_type: TableModelType,
@@ -287,7 +322,7 @@ pub struct TableStructureConfig {
 impl Default for TableStructureConfig {
     fn default() -> Self {
         Self {
-            model_path: std::path::PathBuf::from("models/DocOCR/slanext-wireless.rten"),
+            model_path: std::path::PathBuf::from("models/DocOCR/slanet-plus.onnx"),
             model_type: TableModelType::Wireless,
         }
     }
@@ -303,132 +338,34 @@ impl TableStructureRecognizer {
     pub fn new(config: TableStructureConfig) -> Result<Self, EngineError> {
         let engine_config = EngineConfig::default();
         let session = EngineSession::from_path(&config.model_path, &engine_config)?;
-        
-        Ok(Self { _session: session, _config: config })
+
+        Ok(Self {
+            _session: session,
+            _config: config,
+        })
     }
 
-    pub fn with_custom_session(config: TableStructureConfig, session: impl InferenceSession + 'static) -> Self {
+    pub fn with_custom_session(
+        config: TableStructureConfig,
+        session: impl InferenceSession + 'static,
+    ) -> Self {
         Self {
             _session: EngineSession::from_custom(session),
             _config: config,
         }
     }
 
-    /// Recognize table structure from image
-    /// Returns a grid structure that can be filled with OCR text
+    /// Decode SLANet Plus output in crop-pixel coordinates. Unsupported models,
+    /// malformed grids and truncated sequences return an error (never a fake cell).
     pub fn recognize(&mut self, img: &Mat) -> Result<TableStructure, EngineError> {
-        // Preprocess for SLANet (typically 488x488)
-        let input_tensor = self.preprocess(img)?;
-        
-        // Run inference
-        let mut inputs = HashMap::new();
-        inputs.insert("image".to_string(), input_tensor);
-        
-        let outputs = self._session.run_with_inputs(inputs)?;
-        
-        // Postprocess: parse structure tokens
-        self.postprocess(outputs, img)
+        Ok(self.recognize_with_score(img)?.structure)
     }
 
-    fn preprocess(&self, image: &Mat) -> Result<ArrayD<f32>, EngineError> {
-        #[cfg(feature = "use-opencv")]
-        let (_orig_h, _orig_w) = (image.rows(), image.cols());
-        
-        #[cfg(not(feature = "use-opencv"))]
-        let size = image.size()?;
-        #[cfg(not(feature = "use-opencv"))]
-        let (_orig_h, _orig_w) = (size.height, size.width);
-        
-        // SLANet expects 488x488 input
-        let target_h = 488;
-        let target_w = 488;
-        
-        #[cfg(not(feature = "use-opencv"))]
-        {
-            use crate::image_impl::{resize, Size, INTER_LINEAR};
-            
-            let mut resized = Mat::default();
-            resize(image, &mut resized, Size::new(target_w, target_h), INTER_LINEAR)?;
-            
-            // Normalize [0, 255] -> [0, 1]
-            let target_h_usize = target_h as usize;
-            let target_w_usize = target_w as usize;
-            let mut data = vec![0.0f32; 3 * target_h_usize * target_w_usize];
-            
-            for y in 0..target_h {
-                for x in 0..target_w {
-                    let pixel = resized.get_pixel(x as u32, y as u32);
-                    for (c, &pixel_c) in pixel.iter().enumerate() {
-                        let val = pixel_c as f32 / 255.0;
-                        let idx = c * target_h_usize * target_w_usize + (y as usize) * target_w_usize + (x as usize);
-                        data[idx] = val;
-                    }
-                }
-            }
-            
-            let arr = Array3::from_shape_vec((3, target_h_usize, target_w_usize), data)
-                .map_err(|e| EngineError::Preprocess(e.to_string()))?;
-            
-            Ok(arr.insert_axis(ndarray::Axis(0)).into_dyn())
-        }
-        
-        #[cfg(feature = "use-opencv")]
-        {
-            use opencv::{core, imgproc};
-            
-            let mut resized = Mat::default();
-            imgproc::resize(
-                image,
-                &mut resized,
-                core::Size::new(target_w, target_h),
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
-            )?;
-            
-            let target_h_usize = target_h as usize;
-            let target_w_usize = target_w as usize;
-            let hw = target_h_usize * target_w_usize;
-            let mut data = vec![0.0f32; 3 * hw];
-            
-            for y in 0..target_h_usize {
-                for x in 0..target_w_usize {
-                    let pix = resized.at_2d::<core::Vec3b>(y as i32, x as i32)?;
-                    let idx = y * target_w_usize + x;
-                    for c in 0..3 {
-                        let val = pix[c] as f32 / 255.0;
-                        data[c * hw + idx] = val;
-                    }
-                }
-            }
-            
-            let arr = Array3::from_shape_vec((3, target_h_usize, target_w_usize), data)
-                .map_err(|e| EngineError::Preprocess(e.to_string()))?;
-            
-            Ok(arr.insert_axis(ndarray::Axis(0)).into_dyn())
-        }
-    }
-
-    fn postprocess(&self, _outputs: HashMap<String, ArrayD<f32>>, _img: &Mat) -> Result<TableStructure, EngineError> {
-        // SLANet outputs structure tokens that need to be decoded
-        // This requires understanding the specific model output format
-        // For now, return a simple 1x1 structure as placeholder
-        
-        // Create a simple single-cell structure
-        let cell = TableCell {
-            bbox: BBox { x_min: 0, y_min: 0, x_max: 100, y_max: 100 },
-            row: 0,
-            col: 0,
-            row_span: 1,
-            col_span: 1,
-            text: String::new(), // Will be filled by OCR
-        };
-        
-        Ok(TableStructure {
-            rows: vec![TableRow { cells: vec![cell] }],
-            num_rows: 1,
-            num_cols: 1,
-        })
+    pub fn recognize_with_score(&mut self, img: &Mat) -> Result<TablePrediction, EngineError> {
+        let input = slanet::preprocess(img)?;
+        // Use the actual single input name (Paddle exports it as `x`).
+        let outputs = self._session.run_all(input)?;
+        slanet::decode(&outputs, img.cols(), img.rows())
     }
 }
 
@@ -443,7 +380,12 @@ mod tests {
                 TableRow {
                     cells: vec![
                         TableCell {
-                            bbox: BBox { x_min: 0, y_min: 0, x_max: 100, y_max: 30 },
+                            bbox: BBox {
+                                x_min: 0,
+                                y_min: 0,
+                                x_max: 100,
+                                y_max: 30,
+                            },
                             row: 0,
                             col: 0,
                             row_span: 1,
@@ -451,7 +393,12 @@ mod tests {
                             text: "Header 1".to_string(),
                         },
                         TableCell {
-                            bbox: BBox { x_min: 100, y_min: 0, x_max: 200, y_max: 30 },
+                            bbox: BBox {
+                                x_min: 100,
+                                y_min: 0,
+                                x_max: 200,
+                                y_max: 30,
+                            },
                             row: 0,
                             col: 1,
                             row_span: 1,
@@ -463,7 +410,12 @@ mod tests {
                 TableRow {
                     cells: vec![
                         TableCell {
-                            bbox: BBox { x_min: 0, y_min: 30, x_max: 100, y_max: 60 },
+                            bbox: BBox {
+                                x_min: 0,
+                                y_min: 30,
+                                x_max: 100,
+                                y_max: 60,
+                            },
                             row: 1,
                             col: 0,
                             row_span: 1,
@@ -471,7 +423,12 @@ mod tests {
                             text: "Data 1".to_string(),
                         },
                         TableCell {
-                            bbox: BBox { x_min: 100, y_min: 30, x_max: 200, y_max: 60 },
+                            bbox: BBox {
+                                x_min: 100,
+                                y_min: 30,
+                                x_max: 200,
+                                y_max: 60,
+                            },
                             row: 1,
                             col: 1,
                             row_span: 1,

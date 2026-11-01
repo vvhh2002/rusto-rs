@@ -16,6 +16,10 @@ include = [
     "/README.md",
     "/include/rusto.h",
     "/docs/decoded-rgb.md",
+    "/docs/table-recovery.md",
+    "/tests/fixtures/slanet-plus-real.json",
+    "/tests/fixtures/cubic-resize.json",
+    "/tests/fixtures/table-recovery-sources.md",
     "/LICENSE*",
     "/CHANGELOG.md"
 ]

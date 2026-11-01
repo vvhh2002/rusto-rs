@@ -496,3 +496,7 @@ If you use RustO! in your research or commercial application, please consider ci
   note = {Based on RapidOCR and powered by PaddleOCR models with pure Rust RTen inference}
 }
 ```
+
+### Optional table recovery
+
+The Rust API provides experimental SLANet Plus recovery with preserved source OCR and explicit fallback statuses. See [supported models, usage and limitations](docs/table-recovery.md).

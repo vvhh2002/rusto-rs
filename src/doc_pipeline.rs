@@ -1,272 +1,311 @@
-use std::path::Path;
-
+use crate::{
+    config::InitializeConfig,
+    engine::EngineError,
+    image_impl::Mat,
+    layout::{BBox, LayoutDetector, LayoutOutput, LayoutRegion, LayoutType},
+    rusto_ocr::{OcrRunOptions, RustO},
+    table::recovery::{plain_text, TableRecovery, TableRecoveryPolicy, TableRecoveryStatus},
+    table::{TableDetectorConfig, TableStructureConfig, TableStructureRecognizer},
+    types::LayoutConfig,
+    TextResult,
+};
 #[cfg(feature = "use-opencv")]
-use opencv::{core, imgproc, prelude::*};
-
-#[cfg(not(feature = "use-opencv"))]
-use crate::image_impl::{self, Mat, Rect};
-
-use crate::config::InitializeConfig;
-use crate::engine::EngineError;
-use crate::layout::{LayoutDetector, LayoutRegion, LayoutType};
-use crate::rusto_ocr::RustO;
-use crate::table::{TableDetector, TableDetectorConfig, TableStructureConfig, TableStructureRecognizer};
-use crate::types::LayoutConfig;
+use opencv::prelude::*;
+use std::path::Path;
 
 pub struct DocPipelineConfig {
     pub layout: LayoutConfig,
     pub ocr: InitializeConfig,
+    /// Legacy cell-detector setting. SLANet Plus predicts its own cell boxes.
     pub table_detector: Option<TableDetectorConfig>,
     pub table_recognizer: Option<TableStructureConfig>,
 }
 
 pub struct DocPipeline {
-    layout: LayoutDetector,
+    layout: Option<LayoutDetector>,
     ocr: RustO,
-    table_detector: Option<TableDetector>,
     table_recognizer: Option<TableStructureRecognizer>,
+    recovery_enabled: bool,
+    recovery_policy: TableRecoveryPolicy,
+    initialization_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DocBlock {
     pub region: LayoutRegion,
+    /// Plain text is populated for tables too, including on recovery failure.
     pub text: Option<String>,
-    pub html: Option<String>, // For tables: HTML markup
+    pub html: Option<String>,
+    /// Indices into `DocResult::original_ocr` (each source belongs to one block).
+    pub source_indices: Vec<usize>,
 }
-
+#[derive(Debug, Clone)]
+pub struct DocTableResult {
+    pub region: LayoutRegion,
+    /// Translate recovery-local source indices back to the full page.
+    pub source_indices: Vec<usize>,
+    pub recovery: TableRecovery,
+}
 pub struct DocResult {
     pub blocks: Vec<DocBlock>,
+    /// Unmerged, unmodified full-page OCR boxes. Never replaced by table OCR.
+    pub original_ocr: Vec<TextResult>,
+    pub plain_text: String,
+    pub tables: Vec<DocTableResult>,
+    pub warnings: Vec<String>,
 }
 
 impl DocPipeline {
     pub fn new(config: DocPipelineConfig) -> Result<Self, EngineError> {
-        let layout = LayoutDetector::new(config.layout)?;
+        // OCR is required; layout and table models are optional enrichments.
         let ocr = RustO::initialize(config.ocr)?;
-        
-        // Initialize table recognition components if configured
-        let table_detector = if let Some(detector_config) = config.table_detector {
-            Some(TableDetector::new(detector_config)?)
-        } else {
-            None
+        let mut warnings = Vec::new();
+        let layout = match LayoutDetector::new(config.layout) {
+            Ok(model) => Some(model),
+            Err(e) => {
+                warnings.push(format!("Layout disabled: {e}"));
+                None
+            }
         };
-        
-        let table_recognizer = if let Some(recognizer_config) = config.table_recognizer {
-            Some(TableStructureRecognizer::new(recognizer_config)?)
-        } else {
-            None
-        };
-        
-        Ok(Self { 
-            layout, 
+        let recognizer =
+            config
+                .table_recognizer
+                .and_then(|c| match TableStructureRecognizer::new(c) {
+                    Ok(model) => Some(model),
+                    Err(e) => {
+                        warnings.push(format!("Table recovery disabled: {e}"));
+                        None
+                    }
+                });
+        if config.table_detector.is_some() {
+            warnings
+                .push("SLANet Plus uses its own boxes; legacy cell detector is not loaded".into());
+        }
+        let mut pipeline = Self::with_components(ocr, layout, recognizer);
+        pipeline.initialization_warnings = warnings;
+        Ok(pipeline)
+    }
+
+    /// Supply an explicit layout preset or custom inference sessions.
+    pub fn with_components(
+        ocr: RustO,
+        layout: Option<LayoutDetector>,
+        recognizer: Option<TableStructureRecognizer>,
+    ) -> Self {
+        Self {
             ocr,
-            table_detector,
-            table_recognizer,
-        })
-    }
-
-    pub fn run<P: AsRef<Path>>(&mut self, image_path: P) -> Result<DocResult, EngineError> {
-        #[cfg(feature = "use-opencv")]
-        use crate::image_impl::imread;
-        #[cfg(not(feature = "use-opencv"))]
-        use crate::image_impl::imread;
-
-        let img = imread(image_path)?;
-
-        // 1. Layout Analysis
-        let layout_output = self.layout.detect(&img)?;
-        let mut regions = layout_output.regions;
-
-        // Sort regions: top-to-bottom, left-to-right
-        regions.sort_by(|a, b| {
-            let y_diff = (a.bbox.y_min - b.bbox.y_min).abs();
-            if y_diff < 20 {
-                // Tolerance for same line
-                a.bbox.x_min.cmp(&b.bbox.x_min)
-            } else {
-                a.bbox.y_min.cmp(&b.bbox.y_min)
-            }
-        });
-
-        let mut blocks = Vec::new();
-
-        // 2. Process each region
-        for region in regions {
-            match region.layout_type {
-                LayoutType::Text
-                | LayoutType::Title
-                | LayoutType::FigureCaption
-                | LayoutType::TableCaption
-                | LayoutType::Header
-                | LayoutType::Footer
-                | LayoutType::Reference
-                | LayoutType::Equation => {
-                    // Crop and OCR
-                    let crop = self.crop_image(&img, &region)?;
-                    let ocr_res = self.ocr.run_on_mat_with_options(
-                        &crop,
-                        &crate::OcrRunOptions::default(),
-                    )?;
-
-                    // Combine text lines
-                    let text = ocr_res.txts.join(" ");
-                    blocks.push(DocBlock {
-                        region,
-                        text: Some(text),
-                        html: None,
-                    });
-                }
-                LayoutType::Figure => {
-                    // Figures - just store region
-                    blocks.push(DocBlock { 
-                        region, 
-                        text: None,
-                        html: None,
-                    });
-                }
-                LayoutType::Table => {
-                    // Tables - run recognition if configured
-                    if self.table_detector.is_some() && self.table_recognizer.is_some() {
-                        match self.process_table(&img, &region) {
-                            Ok(html) => {
-                                blocks.push(DocBlock {
-                                    region,
-                                    text: None,
-                                    html: Some(html),
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("Table recognition failed: {}", e);
-                                blocks.push(DocBlock { region, text: None, html: None });
-                            }
-                        }
-                    } else {
-                        // No table recognition configured
-                        blocks.push(DocBlock { region, text: None, html: None });
-                    }
-                }
-            }
+            layout,
+            table_recognizer: recognizer,
+            recovery_enabled: true,
+            recovery_policy: TableRecoveryPolicy::default(),
+            initialization_warnings: vec![],
         }
-
-        Ok(DocResult { blocks })
     }
-
-    /// Process a table region: recognize structure and OCR cells
-    fn process_table(&mut self, img: &Mat, region: &LayoutRegion) -> Result<String, EngineError> {
-        // 1. Crop table region
-        let table_crop = self.crop_image(img, region)?;
-        
-        // 2. Recognize table structure
-        let mut structure = self.table_recognizer.as_mut().unwrap()
-            .recognize(&table_crop)?;
-        
-        // 3. OCR each cell
-        #[cfg(feature = "use-opencv")]
-        let (img_h, img_w) = (table_crop.rows(), table_crop.cols());
-        #[cfg(not(feature = "use-opencv"))]
-        let size = table_crop.size()?;
-        #[cfg(not(feature = "use-opencv"))]
-        let (img_h, img_w) = (size.height, size.width);
-        
-        for row in &mut structure.rows {
-            for cell in &mut row.cells {
-                // Scale cell bbox to actual image size
-                let cell_bbox = &cell.bbox;
-                let x_min = (cell_bbox.x_min as f32 * img_w as f32 / 100.0) as i32;
-                let y_min = (cell_bbox.y_min as f32 * img_h as f32 / 100.0) as i32;
-                let x_max = (cell_bbox.x_max as f32 * img_w as f32 / 100.0) as i32;
-                let y_max = (cell_bbox.y_max as f32 * img_h as f32 / 100.0) as i32;
-                
-                // Create a region for the cell
-                let cell_region = LayoutRegion {
-                    bbox: crate::layout::BBox { x_min, y_min, x_max, y_max },
-                    layout_type: LayoutType::Text,
-                    confidence: 1.0,
-                };
-                
-                // Crop and OCR the cell
-                match self.crop_image(&table_crop, &cell_region) {
-                    Ok(cell_crop) => {
-                        match self.ocr.run_on_mat_with_options(
-                            &cell_crop,
-                            &crate::OcrRunOptions::default(),
-                        ) {
-                            Ok(ocr_res) => {
-                                cell.text = ocr_res.txts.join(" ");
-                            }
-                            Err(_) => {
-                                cell.text = String::new();
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        cell.text = String::new();
-                    }
-                }
-            }
-        }
-        
-        // 4. Generate HTML
-        Ok(structure.to_html())
+    pub fn set_table_recovery_enabled(&mut self, enabled: bool) {
+        self.recovery_enabled = enabled;
     }
-
-    #[cfg(feature = "use-opencv")]
-    fn crop_image(&self, img: &Mat, region: &LayoutRegion) -> Result<Mat, EngineError> {
-        let rect = core::Rect::new(
-            region.bbox.x_min,
-            region.bbox.y_min,
-            region.bbox.x_max - region.bbox.x_min,
-            region.bbox.y_max - region.bbox.y_min,
+    pub fn set_table_recovery_policy(&mut self, policy: TableRecoveryPolicy) {
+        self.recovery_policy = policy;
+    }
+    pub fn run<P: AsRef<Path>>(&mut self, path: P) -> Result<DocResult, EngineError> {
+        self.run_with_options(path, &OcrRunOptions::default())
+    }
+    pub fn run_with_options<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        options: &OcrRunOptions,
+    ) -> Result<DocResult, EngineError> {
+        options.validate()?;
+        let image = crate::image_impl::imread(path)?;
+        let ocr = self
+            .ocr
+            .run_on_mat_with_options(&image, options)?
+            .to_text_results();
+        let layout = match self.layout.as_mut() {
+            Some(model) => model.detect(&image),
+            None => Ok(LayoutOutput {
+                regions: vec![],
+                elapse: 0.0,
+            }),
+        };
+        let mut result = enrich_document(
+            &image,
+            ocr,
+            layout,
+            self.table_recognizer.as_mut(),
+            self.recovery_enabled,
+            &self.recovery_policy,
         );
-
-        // Ensure rect is within image bounds
-        let img_w = img.cols();
-        let img_h = img.rows();
-        let x = rect.x.max(0).min(img_w - 1);
-        let y = rect.y.max(0).min(img_h - 1);
-        let w = rect.width.min(img_w - x);
-        let h = rect.height.min(img_h - y);
-
-        if w <= 0 || h <= 0 {
-            return Err(EngineError::ImageError("Invalid crop region".to_string()));
-        }
-
-        let valid_rect = core::Rect::new(x, y, w, h);
-        let cropped = Mat::roi(img, valid_rect)?;
-        let mut dst = Mat::default();
-        cropped.copy_to(&mut dst)?;
-        Ok(dst)
+        result
+            .warnings
+            .splice(0..0, self.initialization_warnings.clone());
+        Ok(result)
     }
+}
 
+fn clip_region(region: &mut LayoutRegion, w: i32, h: i32) -> bool {
+    let b = &mut region.bbox;
+    b.x_min = b.x_min.clamp(0, w);
+    b.x_max = b.x_max.clamp(0, w);
+    b.y_min = b.y_min.clamp(0, h);
+    b.y_max = b.y_max.clamp(0, h);
+    b.x_min < b.x_max && b.y_min < b.y_max && region.confidence.is_finite()
+}
+fn crop(image: &Mat, b: &BBox) -> Result<Mat, EngineError> {
     #[cfg(not(feature = "use-opencv"))]
-    fn crop_image(&self, img: &Mat, region: &LayoutRegion) -> Result<Mat, EngineError> {
-        let rect = Rect {
-            x: region.bbox.x_min,
-            y: region.bbox.y_min,
-            width: (region.bbox.x_max - region.bbox.x_min) as u32,
-            height: (region.bbox.y_max - region.bbox.y_min) as u32,
-        };
-
-        // Ensure rect is within image bounds
-        let size = img.size()?;
-        let img_w = size.width;
-        let img_h = size.height;
-
-        let x = rect.x.max(0).min(img_w - 1);
-        let y = rect.y.max(0).min(img_h - 1);
-        let w = rect.width.min((img_w - x) as u32);
-        let h = rect.height.min((img_h - y) as u32);
-
-        if w == 0 || h == 0 {
-            return Err(EngineError::ImageError("Invalid crop region".to_string()));
+    {
+        crate::image_impl::crop(
+            image,
+            crate::image_impl::Rect {
+                x: b.x_min,
+                y: b.y_min,
+                width: (b.x_max - b.x_min) as u32,
+                height: (b.y_max - b.y_min) as u32,
+            },
+        )
+        .map_err(|e| EngineError::ImageError(e.to_string()))
+    }
+    #[cfg(feature = "use-opencv")]
+    {
+        let region =
+            opencv::core::Rect::new(b.x_min, b.y_min, b.x_max - b.x_min, b.y_max - b.y_min);
+        Ok(Mat::roi(image, region)?.try_clone()?)
+    }
+}
+fn coverage(text: &TextResult, b: &BBox) -> f32 {
+    let f = &text.frame;
+    if f.width <= 0. || f.height <= 0. {
+        return 0.0;
+    }
+    let x = ((f.left + f.width).min(b.x_max as f32) - f.left.max(b.x_min as f32)).max(0.0);
+    let y = ((f.top + f.height).min(b.y_max as f32) - f.top.max(b.y_min as f32)).max(0.0);
+    let result = x * y / (f.width * f.height);
+    if result.is_finite() {
+        result
+    } else {
+        0.0
+    }
+}
+fn enrich_document(
+    image: &Mat,
+    ocr: Vec<TextResult>,
+    layout: Result<LayoutOutput, EngineError>,
+    mut recognizer: Option<&mut TableStructureRecognizer>,
+    enabled: bool,
+    policy: &TableRecoveryPolicy,
+) -> DocResult {
+    let mut warnings = vec![];
+    let mut regions = match layout {
+        Ok(result) => result.regions,
+        Err(e) => {
+            warnings.push(format!("Layout failed; preserving OCR: {e}"));
+            vec![]
         }
-
-        let valid_rect = Rect {
-            x,
-            y,
-            width: w,
-            height: h,
+    };
+    let (w, h) = (image.cols().max(0), image.rows().max(0));
+    regions.retain_mut(|r| clip_region(r, w, h));
+    regions.sort_by_key(|r| (r.bbox.y_min, r.bbox.x_min));
+    let mut members = vec![Vec::new(); regions.len()];
+    let mut unassigned = Vec::new();
+    for (i, text) in ocr.iter().enumerate() {
+        let target = regions
+            .iter()
+            .enumerate()
+            .filter_map(|(j, r)| {
+                let score = coverage(text, &r.bbox);
+                (score >= 0.5).then_some((j, score, r.layout_type == LayoutType::Table))
+            })
+            .max_by(|a, b| a.2.cmp(&b.2).then(a.1.total_cmp(&b.1)).then(b.0.cmp(&a.0)));
+        if let Some((j, _, _)) = target {
+            members[j].push(i);
+        } else {
+            unassigned.push(i);
+        }
+    }
+    let mut blocks = vec![];
+    let mut tables = vec![];
+    for (region, indices) in regions.into_iter().zip(members) {
+        let source: Vec<_> = indices.iter().map(|&i| ocr[i].clone()).collect();
+        let text = plain_text(&source);
+        let mut html = None;
+        if region.layout_type == LayoutType::Table {
+            let local: Vec<_> = source
+                .iter()
+                .cloned()
+                .map(|mut t| {
+                    t.frame.left -= region.bbox.x_min as f32;
+                    t.frame.top -= region.bbox.y_min as f32;
+                    for point in &mut t.box_points {
+                        point.0 -= region.bbox.x_min as f32;
+                        point.1 -= region.bbox.y_min as f32;
+                    }
+                    t
+                })
+                .collect();
+            let recovery = if !enabled || recognizer.is_none() {
+                TableRecovery::fallback(
+                    &local,
+                    TableRecoveryStatus::Disabled,
+                    "Table model unavailable or recovery disabled",
+                )
+            } else {
+                match crop(image, &region.bbox) {
+                    Ok(cropped) => recognizer
+                        .as_deref_mut()
+                        .unwrap()
+                        .recover(&cropped, &local, policy),
+                    Err(e) => TableRecovery::fallback(
+                        &local,
+                        TableRecoveryStatus::InvalidRegion,
+                        e.to_string(),
+                    ),
+                }
+            };
+            html = recovery.to_html();
+            tables.push(DocTableResult {
+                region: region.clone(),
+                source_indices: indices.clone(),
+                recovery,
+            });
+        }
+        let block_text = if source.is_empty() && region.layout_type == LayoutType::Figure {
+            None
+        } else {
+            Some(text)
         };
-        image_impl::crop(img, valid_rect).map_err(|e| EngineError::ImageError(e.to_string()))
+        blocks.push(DocBlock {
+            region,
+            text: block_text,
+            html,
+            source_indices: indices,
+        });
+    }
+    // Layout can miss text or return no regions. Preserve every uncovered box.
+    for i in unassigned {
+        let f = &ocr[i].frame;
+        blocks.push(DocBlock {
+            region: LayoutRegion {
+                bbox: BBox {
+                    x_min: f.left as i32,
+                    y_min: f.top as i32,
+                    x_max: (f.left + f.width) as i32,
+                    y_max: (f.top + f.height) as i32,
+                },
+                layout_type: LayoutType::Text,
+                confidence: ocr[i].score,
+            },
+            text: Some(ocr[i].text.clone()),
+            html: None,
+            source_indices: vec![i],
+        });
+    }
+    blocks.sort_by_key(|b| (b.region.bbox.y_min, b.region.bbox.x_min));
+    DocResult {
+        plain_text: plain_text(&ocr),
+        original_ocr: ocr,
+        blocks,
+        tables,
+        warnings,
     }
 }
 
@@ -276,6 +315,11 @@ impl DocResult {
         let mut last_was_caption = false;
 
         for (idx, block) in self.blocks.iter().enumerate() {
+            if let Some(html) = &block.html {
+                md.push_str(&format!("\n{}\n\n", html));
+                last_was_caption = false;
+                continue;
+            }
             if let Some(text) = &block.text {
                 if text.trim().is_empty() {
                     continue;
@@ -345,9 +389,12 @@ impl DocResult {
                 match block.region.layout_type {
                     LayoutType::Figure => {
                         // Check if next block is a figure caption
-                        let has_caption = idx + 1 < self.blocks.len() 
-                            && matches!(self.blocks[idx + 1].region.layout_type, LayoutType::FigureCaption);
-                        
+                        let has_caption = idx + 1 < self.blocks.len()
+                            && matches!(
+                                self.blocks[idx + 1].region.layout_type,
+                                LayoutType::FigureCaption
+                            );
+
                         if !has_caption && !last_was_caption {
                             // No caption, show placeholder
                             md.push_str("![Figure]\n\n");
@@ -365,8 +412,12 @@ impl DocResult {
                             md.push_str(&format!("\n{}\n\n", html));
                         } else {
                             // No table recognition - show placeholder
-                            md.push_str("| Table | (Structure recognition not yet implemented) |\n");
-                            md.push_str("|-------|---------------------------------------------|\n\n");
+                            md.push_str(
+                                "| Table | (Structure recognition not yet implemented) |\n",
+                            );
+                            md.push_str(
+                                "|-------|---------------------------------------------|\n\n",
+                            );
                         }
                         last_was_caption = false;
                     }
@@ -385,8 +436,157 @@ impl DocResult {
         trimmed.starts_with("- ")
             || trimmed.starts_with("* ")
             || trimmed.starts_with("• ")
-            || (trimmed.len() > 2 
+            || (trimmed.len() > 2
                 && trimmed.chars().next().unwrap().is_ascii_digit()
                 && (trimmed.chars().nth(1) == Some('.') || trimmed.chars().nth(1) == Some(')')))
+    }
+}
+
+#[cfg(all(test, not(feature = "use-opencv")))]
+mod recovery_tests {
+    use super::*;
+    use crate::Frame;
+    fn source(text: &str, x: f32, y: f32) -> TextResult {
+        let points = [(x, y), (x + 15., y), (x + 15., y + 10.), (x, y + 10.)];
+        TextResult {
+            text: text.into(),
+            score: 0.95,
+            frame: Frame::from_points(&points),
+            box_points: points,
+        }
+    }
+    fn image() -> Mat {
+        Mat::from_rgb8(100, 100, vec![255; 100 * 100 * 3]).unwrap()
+    }
+    fn region(kind: LayoutType, x0: i32, y0: i32, x1: i32, y1: i32) -> LayoutRegion {
+        LayoutRegion {
+            bbox: BBox {
+                x_min: x0,
+                y_min: y0,
+                x_max: x1,
+                y_max: y1,
+            },
+            layout_type: kind,
+            confidence: 0.9,
+        }
+    }
+    #[test]
+    fn missing_or_failed_layout_preserves_all_ocr() {
+        let ocr = vec![source("first", 5., 5.), source("last", 5., 80.)];
+        for layout in [
+            Ok(LayoutOutput {
+                regions: vec![],
+                elapse: 0.0,
+            }),
+            Err(EngineError::Engine("unavailable".into())),
+        ] {
+            let result = enrich_document(
+                &image(),
+                ocr.clone(),
+                layout,
+                None,
+                true,
+                &TableRecoveryPolicy::default(),
+            );
+            assert_eq!(result.original_ocr, ocr);
+            assert_eq!(
+                result
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.source_indices.clone())
+                    .collect::<Vec<_>>(),
+                [0, 1]
+            );
+            assert!(result.to_markdown().contains("first"));
+            assert!(result.to_markdown().contains("last"));
+        }
+    }
+    #[test]
+    fn overlapping_missing_and_invalid_regions_never_drop_or_duplicate_text() {
+        let ocr = vec![
+            source("outside", 5., 5.),
+            source("table", 30., 40.),
+            source("tail", 5., 80.),
+        ];
+        let regions = vec![
+            region(LayoutType::Text, 20, 20, 70, 70),
+            region(LayoutType::Table, 20, 20, 70, 70),
+            region(LayoutType::Table, 80, 80, -10, -10),
+            region(LayoutType::Figure, 200, 0, 250, 50),
+        ];
+        let result = enrich_document(
+            &image(),
+            ocr.clone(),
+            Ok(LayoutOutput {
+                regions,
+                elapse: 0.0,
+            }),
+            None,
+            true,
+            &TableRecoveryPolicy::default(),
+        );
+        assert_eq!(result.original_ocr, ocr);
+        assert_eq!(result.tables.len(), 1);
+        assert_eq!(
+            result.tables[0].recovery.status,
+            TableRecoveryStatus::Disabled
+        );
+        assert_eq!(result.tables[0].recovery.original_ocr[0].frame.left, 10.0);
+        let mut indices: Vec<_> = result
+            .blocks
+            .iter()
+            .flat_map(|b| b.source_indices.clone())
+            .collect();
+        indices.sort();
+        assert_eq!(indices, [0, 1, 2]);
+        for text in ["outside", "table", "tail"] {
+            assert!(result.to_markdown().contains(text));
+        }
+    }
+    #[test]
+    fn runtime_table_failure_returns_readable_text() {
+        use crate::engine::InferenceSession;
+        use ndarray::ArrayD;
+        use std::collections::HashMap;
+        struct Broken;
+        impl InferenceSession for Broken {
+            fn run(&mut self, _: ArrayD<f32>) -> Result<ArrayD<f32>, EngineError> {
+                Err(EngineError::Engine("failed".into()))
+            }
+            fn run_all(
+                &mut self,
+                _: ArrayD<f32>,
+            ) -> Result<HashMap<String, ArrayD<f32>>, EngineError> {
+                Err(EngineError::Engine("failed".into()))
+            }
+            fn run_with_inputs(
+                &mut self,
+                _: HashMap<String, ArrayD<f32>>,
+            ) -> Result<HashMap<String, ArrayD<f32>>, EngineError> {
+                Err(EngineError::Engine("failed".into()))
+            }
+        }
+        let mut recognizer =
+            TableStructureRecognizer::with_custom_session(TableStructureConfig::default(), Broken);
+        let ocr = vec![source("keep", 30., 40.)];
+        let layout = Ok(LayoutOutput {
+            regions: vec![region(LayoutType::Table, 20, 20, 70, 70)],
+            elapse: 0.0,
+        });
+        let result = enrich_document(
+            &image(),
+            ocr.clone(),
+            layout,
+            Some(&mut recognizer),
+            true,
+            &TableRecoveryPolicy::default(),
+        );
+        assert_eq!(
+            result.tables[0].recovery.status,
+            TableRecoveryStatus::ModelError
+        );
+        assert_eq!(result.original_ocr, ocr);
+        assert!(result.blocks[0].html.is_none());
+        assert!(result.to_markdown().contains("keep"));
     }
 }
