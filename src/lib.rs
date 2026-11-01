@@ -48,6 +48,7 @@ pub mod preprocess;
 pub mod rec;
 pub mod rusto_ocr;
 pub mod table;
+mod text_layout;
 pub mod types;
 
 #[cfg(not(feature = "use-opencv"))]

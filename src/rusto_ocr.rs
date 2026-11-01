@@ -723,40 +723,18 @@ fn group_words(
     if words.is_empty() {
         return Vec::new();
     }
-    let mut heights: Vec<f32> = words.iter().map(|word| word.result.frame.height).collect();
-    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let line_tolerance = heights[heights.len() / 2] * line_y_threshold;
-    words.sort_by(|a, b| {
-        a.result
-            .frame
-            .top
-            .partial_cmp(&b.result.frame.top)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                a.result
-                    .frame
-                    .left
-                    .partial_cmp(&b.result.frame.left)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
-    let mut lines: Vec<Vec<AlignedWord>> = Vec::new();
-    for word in words {
-        if let Some(line) = lines.last_mut() {
-            let center = line
-                .iter()
-                .map(|item| item.result.frame.top + item.result.frame.height / 2.0)
-                .sum::<f32>()
-                / line.len() as f32;
-            if ((word.result.frame.top + word.result.frame.height / 2.0) - center).abs()
-                <= line_tolerance
-            {
-                line.push(word);
-                continue;
-            }
-        }
-        lines.push(vec![word]);
-    }
+    let geometry: Vec<_> = words.iter().map(|w| w.result.clone()).collect();
+    let groups = crate::text_layout::line_groups(&geometry, line_y_threshold);
+    let mut words: Vec<Option<AlignedWord>> = words.drain(..).map(Some).collect();
+    let lines: Vec<Vec<AlignedWord>> = groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|i| words[i].take().expect("unique row membership"))
+                .collect()
+        })
+        .collect();
     lines
         .into_iter()
         .flat_map(|mut line| {
@@ -890,79 +868,11 @@ impl RustOOutput {
                 options.word_x_threshold.unwrap_or(0.4),
             );
         }
-        let mut entries = self.to_text_results();
-        if entries.is_empty() {
-            return entries;
-        }
-        let mut heights: Vec<f32> = entries.iter().map(|entry| entry.frame.height).collect();
-        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let tolerance = heights[heights.len() / 2] * options.line_y_threshold.unwrap_or(0.5);
-        entries.sort_by(|a, b| {
-            a.frame
-                .top
-                .partial_cmp(&b.frame.top)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(
-                    a.frame
-                        .left
-                        .partial_cmp(&b.frame.left)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
-        let mut lines: Vec<Vec<crate::TextResult>> = Vec::new();
-        for entry in entries {
-            if let Some(line) = lines.last_mut() {
-                let y = line
-                    .iter()
-                    .map(|item| item.frame.top + item.frame.height / 2.0)
-                    .sum::<f32>()
-                    / line.len() as f32;
-                if ((entry.frame.top + entry.frame.height / 2.0) - y).abs() <= tolerance {
-                    line.push(entry);
-                    continue;
-                }
-            }
-            lines.push(vec![entry]);
-        }
-        lines
-            .into_iter()
-            .flat_map(|mut line| {
-                if line.len() == 1 {
-                    return line;
-                }
-                line.sort_by(|a, b| {
-                    a.frame
-                        .left
-                        .partial_cmp(&b.frame.left)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut segments: Vec<crate::TextResult> = Vec::new();
-                for entry in line {
-                    if let Some(prev) = segments.last_mut() {
-                        let prev_right = prev.frame.left + prev.frame.width;
-                        let gap = entry.frame.left - prev_right;
-                        let avg_height = (prev.frame.height + entry.frame.height) / 2.0;
-                        let max_gap = (avg_height * options.word_x_threshold.unwrap_or(0.4)).max(1.0);
-                        if gap <= max_gap {
-                            prev.text.push(' ');
-                            prev.text.push_str(&entry.text);
-                            prev.score = prev.score.min(entry.score);
-                            let left = prev.frame.left.min(entry.frame.left);
-                            let top = prev.frame.top.min(entry.frame.top);
-                            let right = prev_right.max(entry.frame.left + entry.frame.width);
-                            let bottom = (prev.frame.top + prev.frame.height)
-                                .max(entry.frame.top + entry.frame.height);
-                            let box_points = [(left, top), (right, top), (right, bottom), (left, bottom)];
-                            prev.box_points = box_points;
-                            prev.frame = crate::Frame::from_points(&box_points);
-                            continue;
-                        }
-                    }
-                    segments.push(entry);
-                }
-                segments
-            })
-            .collect()
+        crate::text_layout::merge_line_fragments(
+            &self.to_text_results(),
+            options.line_y_threshold.unwrap_or(0.5),
+            options.word_x_threshold.unwrap_or(0.4),
+        )
     }
 
     /// Export raw OCR results as ASCII format
@@ -1217,7 +1127,7 @@ impl RustOOutput {
         }
 
         // Create tokens from boxes and calculate dimensions
-        let mut tokens: Vec<Token> = self
+        let tokens: Vec<Token> = self
             .boxes
             .iter()
             .zip(self.txts.iter())
@@ -1251,7 +1161,7 @@ impl RustOOutput {
 
         // Calculate average character width
         let avg_char_width = if !tokens.is_empty() {
-            let total_chars: usize = tokens.iter().map(|t| t.text.len()).sum();
+            let total_chars: usize = tokens.iter().map(|t| t.text.chars().count()).sum();
             let total_width: f32 = tokens.iter().map(|t| t.width).sum();
             if total_chars > 0 {
                 total_width / total_chars as f32
@@ -1263,40 +1173,12 @@ impl RustOOutput {
         };
 
         let x_gap_threshold = avg_char_width * x_mult;
-        let y_tolerance = median_height * y_mult; // Tolerance for Top-Y alignment
-
-        // Sort by Top Y first, then by X
-        tokens.sort_by(|a, b| {
-            a.y.partial_cmp(&b.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
-        });
-
-        // Group into lines based on Top Y alignment
-        let mut lines: Vec<Vec<Token>> = Vec::new();
-        let mut current_line: Vec<Token> = Vec::new();
-        let mut current_line_y_sum: f32 = 0.0;
-
-        for token in tokens {
-            if !current_line.is_empty() {
-                let current_line_avg_y = current_line_y_sum / current_line.len() as f32;
-
-                if (token.y - current_line_avg_y).abs() <= y_tolerance {
-                    current_line.push(token.clone());
-                    current_line_y_sum += token.y;
-                } else {
-                    lines.push(current_line);
-                    current_line = vec![token.clone()];
-                    current_line_y_sum = token.y;
-                }
-            } else {
-                current_line = vec![token.clone()];
-                current_line_y_sum = token.y;
-            }
-        }
-        if !current_line.is_empty() {
-            lines.push(current_line);
-        }
+        let geometry = self.to_text_results();
+        let groups = crate::text_layout::line_groups(&geometry, y_mult);
+        let lines: Vec<Vec<Token>> = groups
+            .into_iter()
+            .map(|group| group.into_iter().map(|i| tokens[i].clone()).collect())
+            .collect();
 
         // Build output using cursor-based approach
         let mut result = String::new();
@@ -1387,5 +1269,81 @@ impl RustOOutput {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod row_grouping_regression_tests {
+    use super::*;
+
+    #[test]
+    fn line_word_and_spatial_outputs_keep_small_adjacent_rows_separate() {
+        let frames = [
+            (0.0, 0.0, 200.0, 40.0),
+            (0.0, 60.0, 200.0, 40.0),
+            (0.0, 120.0, 200.0, 40.0),
+            (10.0, 200.0, 100.0, 8.0),
+            (0.0, 209.0, 100.0, 8.0),
+        ];
+        let boxes: Vec<_> = frames
+            .into_iter()
+            .map(|(x, y, w, h)| {
+                [
+                    Point2f::new(x, y),
+                    Point2f::new(x + w, y),
+                    Point2f::new(x + w, y + h),
+                    Point2f::new(x, y + h),
+                ]
+            })
+            .collect();
+        let txts: Vec<String> = ["Header", "Title", "Large", "upper", "lower"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut output = RustOOutput {
+            boxes: boxes.clone(),
+            txts: txts.clone(),
+            scores: vec![0.9; 5],
+            word_results: vec![],
+            orientation: None,
+            elapse_det: 0.0,
+            elapse_rec: 0.0,
+            elapse_orient: 0.0,
+            debug_oriented_image: None,
+            y_threshold_multiplier: None,
+            x_threshold_multiplier: None,
+        };
+        assert_eq!(
+            output
+                .to_text_results_with_options(&OcrRunOptions::default())
+                .iter()
+                .map(|t| t.text.clone())
+                .collect::<Vec<_>>(),
+            txts
+        );
+        let spatial = output.to_spatial_text(None, None);
+        let lines: Vec<_> = spatial
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines, ["Header", "Title", "Large", "upper", "lower"]);
+        output.word_results = txts
+            .iter()
+            .zip(boxes)
+            .map(|(s, b)| vec![(s.clone(), 0.9, b)])
+            .collect();
+        let options = OcrRunOptions {
+            output: OutputGranularity::Words,
+            ..Default::default()
+        };
+        assert_eq!(
+            output
+                .to_text_results_with_options(&options)
+                .iter()
+                .map(|t| t.text.clone())
+                .collect::<Vec<_>>(),
+            txts
+        );
     }
 }
